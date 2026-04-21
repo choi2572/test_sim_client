@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# Copyright: integration shim — minimal read (Isaac Lab SHM) → inference POST → print action.
+# Copyright: integration shim — minimal read (Isaac Lab SHM + DDS) → inference POST → print action.
 """
-Minimal bridge shim: one RGB frame (shared memory), one robot state (shared memory),
+Minimal bridge shim: one RGB frame (shared memory), one robot state (default: DDS rt/lowstate),
 one HTTP POST using the exact JSON keys expected by unitree_deploy's LongConnectionClient.
 
 TODO: deployment/model_server/run_real_eval_server.py exposes POST /act with a different
@@ -11,9 +11,13 @@ TODO: LongConnectionClient expects response {"result": "ok", "action": ...}. The
       FastAPI VLA server returns a raw action array (or json_numpy). If your server is
       run_real_eval_server.py, responses will not match this client — add a gateway or
       extend parsing below.
-TODO: Proprio "observation.state" here is isaac_robot_state["joint_positions"] only.
-      robot_client.py uses real env obs.observation["qpos"]; verify dims/order match your ckpt.
+TODO: Proprio from DDS LowState_.motor_state[*].q may differ in length/order from
+      isaac_robot_state['joint_positions'] / real robot qpos; verify against your ckpt.
 TODO: Whole-body / dds_wholebody command paths are intentionally not implemented.
+
+Note: unitree_sim_isaaclab SharedMemoryManager creates an anonymous segment when the named
+      segment is missing, so a second process cannot open "isaac_robot_state" by name.
+      Default --robot-state-source dds avoids that without patching the sim repo.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, MutableMapping
@@ -43,7 +48,6 @@ if not _ISAACLAB_ROOT.is_dir():
     )
 sys.path.insert(0, str(_ISAACLAB_ROOT))
 
-from dds.sharedmemorymanager import SharedMemoryManager  # noqa: E402
 from tools.shared_memory_utils import MultiImageReader  # noqa: E402
 
 # Exact copies of robot_client.py (unitree_deploy/scripts/robot_client.py) — do not rename.
@@ -101,33 +105,107 @@ def read_one_rgb(
     return rgb
 
 
-def read_one_robot_state(
-    shm: SharedMemoryManager,
+def read_one_robot_state_shm(
     log: logging.Logger,
+    shm_name: str,
+    shm_size: int,
+    wait_sec: float,
+    poll_sec: float,
 ) -> np.ndarray:
     """
-    Read one dict from isaac_robot_state (JSON via SharedMemoryManager).
+    Read joint_positions from named JSON SHM (same key as G1RobotDDS.write_robot_state).
 
-    TODO: G1RobotDDS.write_robot_state writes joint_positions from a reordered 29-DOF slice;
-          confirm this ordering matches training / VLA norm_stats for your unnorm_key.
+    TODO: Often fails from a second process: unitree_sim_isaaclab/dds/sharedmemorymanager.py
+          creates an anonymous segment on miss, so the sim and this process do not share memory.
+          Prefer --robot-state-source dds unless the sim repo is patched to create named SHM.
     """
-    data = shm.read_data()
-    if not data:
-        raise RuntimeError(
-            "isaac_robot_state read_data() returned empty/None. "
-            "Is the sim publishing state (g1_29dof_state / DDS bridge active)?"
+    from dds.sharedmemorymanager import SharedMemoryManager  # noqa: WPS433 — local import
+
+    shm = SharedMemoryManager(name=shm_name, size=shm_size)
+    log.info(
+        "Robot state SHM requested=%r attached_as=%r created_new=%s",
+        shm_name,
+        shm.get_name(),
+        getattr(shm, "created", None),
+    )
+    deadline = time.monotonic() + max(0.0, wait_sec)
+    data = None
+    while True:
+        data = shm.read_data()
+        if data:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "isaac_robot_state read_data() empty after wait. "
+                "This usually means the shim attached to a different anonymous SHM than sim. "
+                "Use --robot-state-source dds (default) or patch SharedMemoryManager to use "
+                "SharedMemory(name=..., create=True, size=...)."
+            )
+        log.info(
+            "Waiting for robot state SHM; retry in %.2fs (%.1fs left)",
+            poll_sec,
+            max(0.0, deadline - time.monotonic()),
         )
-    log.debug("isaac_robot_state raw keys: %s", sorted(data.keys()))
+        time.sleep(poll_sec)
+    log.debug("SHM state keys: %s", sorted(data.keys()))
     if "joint_positions" not in data:
         raise KeyError(
-            "isaac_robot_state has no 'joint_positions' key — not guessing other fields. "
+            "Robot state SHM has no 'joint_positions' key — not guessing. "
             f"Keys present: {list(data.keys())}"
         )
     qpos = np.asarray(data["joint_positions"], dtype=np.float32)
+    log.info("State source: SHM joint_positions -> shape=%s dtype=%s", qpos.shape, qpos.dtype)
+    return qpos
+
+
+def read_one_robot_state_dds(
+    log: logging.Logger,
+    wait_sec: float,
+    poll_sec: float,
+    dds_domain: int,
+    topic: str,
+) -> np.ndarray:
+    """
+    Subscribe once to Unitree LowState (same topic sim publishes: rt/lowstate).
+
+    Uses ChannelFactoryInitialize(dds_domain); sim_main notes domain 1 for this project.
+    """
+    try:
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+    except ImportError as e:
+        raise ImportError(
+            "unitree_sdk2py is required for --robot-state-source dds. "
+            "Install the same environment you use for sim_main.py."
+        ) from e
+
+    ChannelFactoryInitialize(dds_domain)
+    latest: Dict[str, Any] = {"msg": None}
+
+    def _cb(msg: Any, _extra: str = "") -> None:
+        latest["msg"] = msg
+
+    subscriber = ChannelSubscriber(topic, LowState_)
+    subscriber.Init(_cb, 32)
+    log.info("DDS subscriber Init(%r, LowState_), domain=%s", topic, dds_domain)
+
+    deadline = time.monotonic() + max(0.0, wait_sec)
+    while latest["msg"] is None:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"No LowState received on {topic!r} within {wait_sec}s. "
+                "Is sim_main running with G1RobotDDS publishing (g129, non-replay)?"
+            )
+        time.sleep(poll_sec)
+
+    msg = latest["msg"]
+    motor_state = msg.motor_state
+    n = len(motor_state)
+    qpos = np.array([float(motor_state[i].q) for i in range(n)], dtype=np.float32)
     log.info(
-        "State source: isaac_robot_state['joint_positions'] -> shape=%s dtype=%s",
-        qpos.shape,
-        qpos.dtype,
+        "State source: DDS %r motor_state[*].q -> len=%d (TODO: may include unused motors vs 29-DOF sim slice)",
+        topic,
+        n,
     )
     return qpos
 
@@ -253,15 +331,44 @@ def main() -> None:
         help="Deque maxlen for action (matches robot_client cond_obs_queues['action']).",
     )
     parser.add_argument(
+        "--robot-state-source",
+        choices=("dds", "shm"),
+        default="dds",
+        help="dds=subscribe rt/lowstate (default). shm=JSON isaac_robot_state (often broken cross-process).",
+    )
+    parser.add_argument(
+        "--dds-domain",
+        type=int,
+        default=1,
+        help="ChannelFactoryInitialize argument; sim_main uses 1.",
+    )
+    parser.add_argument(
+        "--lowstate-topic",
+        default="rt/lowstate",
+        help="LowState subscriber topic (G1RobotDDS publisher).",
+    )
+    parser.add_argument(
         "--robot-state-shm-name",
         default="isaac_robot_state",
-        help="Shared memory name written by G1RobotDDS / g1_29dof_state (do not guess).",
+        help="Only for --robot-state-source shm.",
     )
     parser.add_argument(
         "--robot-state-shm-size",
         type=int,
         default=3072,
-        help="Size passed to SharedMemoryManager (must be >= g1_robot_dds input_size).",
+        help="Only for --robot-state-source shm.",
+    )
+    parser.add_argument(
+        "--wait-robot-state-sec",
+        type=float,
+        default=30.0,
+        help="Wait for first robot state (DDS message or SHM payload).",
+    )
+    parser.add_argument(
+        "--robot-state-poll-sec",
+        type=float,
+        default=0.05,
+        help="Sleep between polls when waiting for robot state.",
     )
     parser.add_argument(
         "-v",
@@ -284,9 +391,23 @@ def main() -> None:
 
     reader = MultiImageReader()
     rgb = read_one_rgb(reader, args.image_slot, log)
-    robot_shm = SharedMemoryManager(name=args.robot_state_shm_name, size=args.robot_state_shm_size)
-    log.info("Attached robot state SHM name=%s", robot_shm.get_name())
-    qpos = read_one_robot_state(robot_shm, log)
+
+    if args.robot_state_source == "dds":
+        qpos = read_one_robot_state_dds(
+            log,
+            wait_sec=args.wait_robot_state_sec,
+            poll_sec=args.robot_state_poll_sec,
+            dds_domain=args.dds_domain,
+            topic=args.lowstate_topic,
+        )
+    else:
+        qpos = read_one_robot_state_shm(
+            log,
+            shm_name=args.robot_state_shm_name,
+            shm_size=args.robot_state_shm_size,
+            wait_sec=args.wait_robot_state_sec,
+            poll_sec=args.robot_state_poll_sec,
+        )
 
     batch = build_batch_from_sim(rgb, qpos, args.robot_type, log)
 
