@@ -1,0 +1,5 @@
+# Dependencies for sim_to_vla_client.py only (not the full simulator or VLA stack).
+json_numpy
+numpy
+opencv-python
+requests
