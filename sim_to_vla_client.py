@@ -7,11 +7,14 @@ Does not start the simulator or VLA server. Does not apply actions back to the s
 from __future__ import annotations
 
 import argparse
+import ctypes
+import inspect
 import json
 import sys
 import time
 from multiprocessing import shared_memory
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -22,7 +25,89 @@ _ISAAC_ROOT = _REPO / "unitree_sim_isaaclab"
 if str(_ISAAC_ROOT) not in sys.path:
     sys.path.insert(0, str(_ISAAC_ROOT))
 
-from tools.shared_memory_utils import MultiImageReader  # noqa: E402
+from tools.shared_memory_utils import SimpleImageHeader, get_shm_name  # noqa: E402
+
+_SHM_ATTACH_WARNED = False
+
+
+def attach_shared_memory_readonly(name: str) -> shared_memory.SharedMemory:
+    """
+    Attach to an existing segment created by the simulator.
+
+    Python 3.12+ defaults to track=True; on close/process exit the resource tracker may
+    shm_unlink the segment and break the still-running sim. Use track=False when supported.
+    """
+    global _SHM_ATTACH_WARNED
+    sig = inspect.signature(shared_memory.SharedMemory)
+    if "track" in sig.parameters:
+        return shared_memory.SharedMemory(name=name, track=False)
+    if not _SHM_ATTACH_WARNED:
+        print(
+            "Warning: This Python has no SharedMemory(track=). If /dev/shm segments disappear "
+            "after the client exits, use Python 3.12+ or keep the client alive (--loop).",
+            flush=True,
+        )
+        _SHM_ATTACH_WARNED = True
+    return shared_memory.SharedMemory(name=name)
+
+
+class AttachOnlyImageReader:
+    """Same decode logic as MultiImageReader.read_single_image, but opens SHM with track=False (3.12+)."""
+
+    def __init__(self) -> None:
+        self.last_timestamps: dict[str, int] = {}
+        self.buffer: dict[str, np.ndarray] = {}
+        self.shms: dict[str, shared_memory.SharedMemory] = {}
+
+    def read_single_image(self, image_name: str) -> Optional[np.ndarray]:
+        try:
+            shm_name = get_shm_name(image_name)
+            if shm_name not in self.shms:
+                try:
+                    self.shms[shm_name] = attach_shared_memory_readonly(shm_name)
+                except FileNotFoundError:
+                    return None
+
+            shm = self.shms[shm_name]
+            header_size = ctypes.sizeof(SimpleImageHeader)
+            header_data = bytes(shm.buf[:header_size])
+            header = SimpleImageHeader.from_buffer_copy(header_data)
+
+            last_ts = self.last_timestamps.get(image_name, 0)
+            if header.timestamp <= last_ts:
+                return self.buffer.get(image_name)
+
+            data_start = header_size
+            data_end = data_start + header.data_size
+            payload = bytes(shm.buf[data_start:data_end])
+
+            if header.encoding == 1:
+                encoded = np.frombuffer(payload, dtype=np.uint8)
+                image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+                if image is None:
+                    return None
+            else:
+                image = np.frombuffer(payload, dtype=np.uint8)
+                expected_size = header.height * header.width * header.channels
+                if image.size != expected_size:
+                    return None
+                image = image.reshape(header.height, header.width, header.channels)
+
+            self.buffer[image_name] = image
+            self.last_timestamps[image_name] = header.timestamp
+            return image
+        except Exception:
+            return None
+
+    def close(self) -> None:
+        for shm in self.shms.values():
+            try:
+                shm.close()
+            except Exception:
+                pass
+        self.shms.clear()
+        self.buffer.clear()
+        self.last_timestamps.clear()
 
 try:
     import json_numpy
@@ -135,7 +220,7 @@ def open_robot_state_shm_readonly(name: str) -> shared_memory.SharedMemory:
     Creating a fresh segment here would not match the simulator's buffer and yields data_len==0 forever.
     """
     try:
-        return shared_memory.SharedMemory(name=name)
+        return attach_shared_memory_readonly(name)
     except FileNotFoundError as e:
         raise RuntimeError(
             f"Shared memory {name!r} does not exist yet. Start the Isaac Lab sim first so "
@@ -344,7 +429,7 @@ def build_g1_state_vector(
 
 
 def read_one_frame(
-    reader: MultiImageReader,
+    reader: AttachOnlyImageReader,
     state_shm: shared_memory.SharedMemory,
     robot_state_shm_name: str,
     *,
@@ -456,11 +541,11 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    reader = MultiImageReader()
+    reader = AttachOnlyImageReader()
     state_shm = open_robot_state_shm_readonly(args.robot_state_shm)
 
     print(
-        "Using: MultiImageReader.read_single_image; shared_memory.SharedMemory(attach-only) + SHM read layout",
+        "Using: AttachOnlyImageReader (track=False on Python 3.12+); robot state SHM same attach mode",
         flush=True,
     )
 
@@ -502,7 +587,11 @@ def main() -> None:
             if not args.loop:
                 break
     finally:
-        state_shm.close()
+        try:
+            state_shm.close()
+        except Exception:
+            pass
+        reader.close()
 
 
 if __name__ == "__main__":
