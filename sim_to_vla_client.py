@@ -178,8 +178,21 @@ def post_act(url: str, observations: list[dict], timeout: float) -> np.ndarray:
     r.raise_for_status()
     text = r.text.strip()
     if text == "error":
-        raise RuntimeError("Server returned error string; check VLA server logs for traceback.")
-    out = json.loads(text)
+        raise RuntimeError(
+            "VLA /act failed: server returned plain text 'error'. Check run_real_eval_server.py logs for the traceback."
+        )
+    try:
+        out = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"VLA /act returned non-JSON body (first 500 chars): {text[:500]!r}"
+        ) from e
+    # FastAPI often JSON-encodes a Python str return as the JSON string "error".
+    if isinstance(out, str) and out == "error":
+        raise RuntimeError(
+            "VLA /act failed: server returned JSON \"error\" (exception inside get_server_action). "
+            "Check the terminal where run_real_eval_server.py is running for the traceback."
+        )
     if isinstance(out, np.ndarray):
         return out
     return np.asarray(out)
