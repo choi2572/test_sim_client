@@ -123,6 +123,15 @@ except ImportError as e:
 VLA_ACT_URL_DEFAULT = "http://127.0.0.1:8777/act"
 ROBOT_STATE_SHM_NAME = "isaac_robot_state"
 
+# G1 arm command path (same as unitree_sim_isaaclab/dds/g1_robot_dds.py subscriber).
+# Not used: send_commands_keyboard.py / send_commands_8bit.py → rt/run_command/cmd (wholebody).
+LOWCMD_TOPIC = "rt/lowcmd"
+LOWCMD_MSG = "unitree_sdk2py.idl.unitree_hg.msg.dds_.LowCmd_"
+
+# Wrist motors in G1_29_JointIndex numbering (see unifolm-vla unitree_deploy arm_indexs.py).
+_WRIST_MOTOR_IDX: frozenset[int] = frozenset({19, 20, 21, 26, 27, 28})
+_LEG_WEAK_KP: frozenset[int] = frozenset({3, 9})  # ankle pitch — lower kp in g1_arm
+
 # `joint_positions` in SHM follow get_robot_boy_joint_states: pos_buf[k] == full_joint_pos[boy_joint_indices[k]]
 # (unitree_sim_isaaclab/tasks/common_observations/g1_29dof_state.py)
 G1_BOY_JOINT_INDICES: tuple[int, ...] = (
@@ -479,6 +488,129 @@ def post_act(url: str, observations: list[dict], timeout: float) -> np.ndarray:
     return np.asarray(out)
 
 
+def shm_boy29_to_motor29_q(joint_positions_boy: np.ndarray) -> np.ndarray:
+    """SHM joint_positions are boy-reordered; LowCmd uses motor index 0..28 (G1_29_JointIndex)."""
+    b = np.asarray(joint_positions_boy, dtype=np.float64).reshape(29)
+    m = np.empty(29)
+    for motor_i in range(29):
+        m[motor_i] = b[_GLOBAL_TO_SHM29[motor_i]]
+    return m
+
+
+def _kp_kd_for_motor(motor_i: int) -> tuple[float, float]:
+    if motor_i in _WRIST_MOTOR_IDX:
+        return 40.0, 1.5
+    if 15 <= motor_i <= 28:
+        return 80.0, 3.0
+    if motor_i in _LEG_WEAK_KP:
+        return 80.0, 3.0
+    return 300.0, 3.0
+
+
+def action_vector_first_timestep(action: np.ndarray) -> np.ndarray:
+    a = np.asarray(action, dtype=np.float64)
+    if a.ndim == 1:
+        return a.reshape(-1)
+    if a.ndim == 2:
+        return a[0].reshape(-1)
+    if a.ndim == 3:
+        return a[0, 0].reshape(-1)
+    raise ValueError(f"Unexpected action shape {a.shape} ndim={a.ndim}")
+
+
+def extract_arm14_joint_targets(step1d: np.ndarray) -> np.ndarray:
+    """
+    Arm-only: return 14 target q for motors 15..28 (left arm then right arm, G1 motor order).
+
+    Does NOT support 23-D EE actions (needs IK). See unitree_sim_isaaclab/action_provider/action_provider_dds.py
+    (_arm_source_indices: command positions[15:29] → sim arm joints).
+    """
+    d = int(step1d.size)
+    arm_clip = 2.5
+    if d == 23:
+        raise RuntimeError(
+            "execute_action: length-23 action is EE_R6 / ee_action_6d space — cannot convert to "
+            "LowCmd joint positions without inverse kinematics. TODO: IK bridge or joint-space policy."
+        )
+    if d == 16:
+        raise RuntimeError(
+            "execute_action: length-16 joint action layout not mapped to sim arm14; TODO verify training order."
+        )
+    if d == 14:
+        return np.clip(step1d, -arm_clip, arm_clip)
+    if d == 29:
+        return np.clip(step1d[15:29], -arm_clip, arm_clip)
+    raise RuntimeError(
+        f"execute_action: unsupported action length {d}. Supported: 14 (arm q), 29 (motor q, uses slice [15:29])."
+    )
+
+
+def _limit_arm_delta(arm_tgt: np.ndarray, arm_cur: np.ndarray, max_delta: float) -> np.ndarray:
+    d = np.clip(arm_tgt - arm_cur, -max_delta, max_delta)
+    return np.clip(arm_cur + d, -2.5, 2.5)
+
+
+def publish_g129_arm_lowcmd(
+    *,
+    joint_positions_shm_boy29: np.ndarray,
+    arm14_target: np.ndarray,
+    max_arm_delta: float,
+    lowcmd_pub: object,
+    crc: object,
+) -> None:
+    """
+    Publish one LowCmd on rt/lowcmd. Simulator G1RobotDDS.dds_subscriber writes dds_robot_cmd SHM;
+    DDSActionProvider.get_action applies arm slots only (legs/waist held from commanded q[0:15]).
+    """
+    from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+
+    motor_q = shm_boy29_to_motor29_q(joint_positions_shm_boy29)
+    arm_cur = motor_q[15:29].copy()
+    arm14 = np.asarray(arm14_target, dtype=np.float64).reshape(14)
+    arm_send = _limit_arm_delta(arm14, arm_cur, max_arm_delta)
+    motor_cmd_q = motor_q.copy()
+    motor_cmd_q[15:29] = arm_send
+
+    print(
+        f"[execute_action] interface: ChannelPublisher(topic={LOWCMD_TOPIC!r}, type={LOWCMD_MSG}) "
+        f"→ sim G1RobotDDS ChannelSubscriber({LOWCMD_TOPIC!r}, LowCmd_) → output_shm dds_robot_cmd "
+        f"→ action_provider/action_provider_dds.py DDSActionProvider.get_action (g129 arm-only indices 15..28)",
+        flush=True,
+    )
+    print(f"[execute_action] parsed arm14 (motors 15..28, after delta limit): {np.array2string(arm_send, precision=4)}", flush=True)
+    print(
+        f"[execute_action] motor q[0:15] hold (no velocity base cmd; not rt/run_command/cmd): "
+        f"{np.array2string(motor_cmd_q[:15], precision=4)}",
+        flush=True,
+    )
+
+    msg = unitree_hg_msg_dds__LowCmd_()
+    msg.mode_pr = 0
+    msg.mode_machine = 0
+    n_motors = len(msg.motor_cmd)
+    for i in range(n_motors):
+        msg.motor_cmd[i].mode = 1
+        if i < 29:
+            kp, kd = _kp_kd_for_motor(i)
+            msg.motor_cmd[i].kp = kp
+            msg.motor_cmd[i].kd = kd
+            msg.motor_cmd[i].q = float(motor_cmd_q[i])
+        else:
+            # Dex / extra motors: not proven for this milestone — conservative stiff hold at 0. TODO: mirror sim defaults.
+            msg.motor_cmd[i].kp = 20.0
+            msg.motor_cmd[i].kd = 1.0
+            msg.motor_cmd[i].q = 0.0
+        msg.motor_cmd[i].dq = 0.0
+        msg.motor_cmd[i].tau = 0.0
+    msg.crc = crc.Crc(msg)
+    try:
+        lowcmd_pub.Write(msg)
+        print("[execute_action] publisher.Write(LowCmd_) completed without exception (ok=True)", flush=True)
+    except Exception as e:
+        print(f"[execute_action] publisher.Write(LowCmd_) failed: {e!r} (ok=False)", flush=True)
+        raise
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="G1-only: SHM observation → POST /act → print action.")
     p.add_argument("--url", default=VLA_ACT_URL_DEFAULT, help="VLA server /act URL")
@@ -539,7 +671,44 @@ def main() -> None:
             "Length should match checkpoint proprio dim (e.g. 23). Order = output state vector order."
         ),
     )
+    p.add_argument(
+        "--execute_action",
+        action="store_true",
+        help=(
+            "After /act, publish arm targets via DDS rt/lowcmd (LowCmd_). Default off = print only. "
+            "Requires joint-space action (14 or 29 dims per timestep); 23-D EE actions are rejected."
+        ),
+    )
+    p.add_argument(
+        "--dds-domain",
+        type=int,
+        default=1,
+        help="ChannelFactoryInitialize(domain_id); match unitree_sim_isaaclab dds_create (default 1)",
+    )
+    p.add_argument(
+        "--execute-max-arm-delta",
+        type=float,
+        default=0.15,
+        help="Max |Δq| rad per arm joint per command (safety)",
+    )
     args = p.parse_args()
+
+    lowcmd_pub = None
+    lowcmd_crc = None
+    if args.execute_action:
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
+        from unitree_sdk2py.utils.crc import CRC
+
+        print(f"[execute_action] ChannelFactoryInitialize({args.dds_domain})", flush=True)
+        ChannelFactoryInitialize(args.dds_domain)
+        lowcmd_pub = ChannelPublisher(LOWCMD_TOPIC, LowCmd_)
+        lowcmd_pub.Init()
+        lowcmd_crc = CRC()
+        print(
+            f"[execute_action] publisher ready: topic={LOWCMD_TOPIC!r} msg=LowCmd_ (persistent for this process)",
+            flush=True,
+        )
 
     reader = AttachOnlyImageReader()
     state_shm = open_robot_state_shm_readonly(args.robot_state_shm)
@@ -583,6 +752,19 @@ def main() -> None:
                 print(f"action first row: {action[0]}", flush=True)
             else:
                 print(f"action first row (1D): {action}", flush=True)
+
+            if args.execute_action:
+                assert lowcmd_pub is not None and lowcmd_crc is not None
+                step_vec = action_vector_first_timestep(action)
+                print(f"[execute_action] first-timestep vector len={step_vec.size}", flush=True)
+                arm14 = extract_arm14_joint_targets(step_vec)
+                publish_g129_arm_lowcmd(
+                    joint_positions_shm_boy29=np.asarray(robot["joint_positions"], dtype=np.float64),
+                    arm14_target=arm14,
+                    max_arm_delta=args.execute_max_arm_delta,
+                    lowcmd_pub=lowcmd_pub,
+                    crc=lowcmd_crc,
+                )
 
             if not args.loop:
                 break
