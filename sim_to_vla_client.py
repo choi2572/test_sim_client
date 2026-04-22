@@ -168,6 +168,80 @@ G1_BOY_JOINT_INDICES: tuple[int, ...] = (
 # G1_29_JointIndex (0..28 body) -> index into 29-vector from SHM
 _GLOBAL_TO_SHM29: dict[int, int] = {g: k for k, g in enumerate(G1_BOY_JOINT_INDICES)}
 
+# Policy /act joint action: 23 floats in ascending motor index order, excluding joints held from sim.
+# Held indices (ankles PR+RR, waist roll+pitch): filled from current SHM→motor q, not from server.
+G1_ACTION23_HOLD_MOTOR_INDICES: frozenset[int] = frozenset({4, 5, 10, 11, 13, 14})
+G1_ACTION23_MOTOR_INDICES_ASC: tuple[int, ...] = tuple(
+    i for i in range(29) if i not in G1_ACTION23_HOLD_MOTOR_INDICES
+)
+assert len(G1_ACTION23_MOTOR_INDICES_ASC) == 23
+
+# Per-motor soft limits (rad); same order as G1_29_JointIndex 0..28 (deploy joint table).
+_G1_LIMIT_LO = (
+    -2.5307,
+    -0.5236,
+    -2.7576,
+    -0.087267,
+    -0.87267,
+    -0.2618,
+    -2.5307,
+    -2.9671,
+    -2.7576,
+    -0.087267,
+    -0.87267,
+    -0.2618,
+    -2.618,
+    -0.52,
+    -0.52,
+    -3.0892,
+    -1.5882,
+    -2.618,
+    -1.0472,
+    -1.972222054,
+    -1.614429558,
+    -1.614429558,
+    -3.0892,
+    -2.2515,
+    -2.618,
+    -1.0472,
+    -1.972222054,
+    -1.614429558,
+    -1.614429558,
+)
+_G1_LIMIT_HI = (
+    2.8798,
+    2.9671,
+    2.7576,
+    2.8798,
+    0.5236,
+    0.2618,
+    2.8798,
+    0.5236,
+    2.7576,
+    2.8798,
+    0.5236,
+    0.2618,
+    2.618,
+    0.52,
+    0.52,
+    2.6704,
+    2.2515,
+    2.618,
+    2.0944,
+    1.972222054,
+    1.614429558,
+    1.614429558,
+    2.6704,
+    1.5882,
+    2.618,
+    2.0944,
+    1.972222054,
+    1.614429558,
+    1.614429558,
+)
+G1_MOTOR_Q_MIN = np.array(_G1_LIMIT_LO, dtype=np.float64)
+G1_MOTOR_Q_MAX = np.array(_G1_LIMIT_HI, dtype=np.float64)
+
 # ---------------------------------------------------------------------------
 # EE 6D 체크포인트의 23차원 proprio는 ee_state_6d (손 위치/자세+허리 등)이지 «관절각 23개»가 아님.
 # 아래 프리셋은 «차원만 23으로 맞춰 서버가 돌아가게» 하려는 실험용이며 학습 분포와 의미가 다름.
@@ -497,6 +571,28 @@ def shm_boy29_to_motor29_q(joint_positions_boy: np.ndarray) -> np.ndarray:
     return m
 
 
+def merge_server23_to_motor29(server23: np.ndarray, motor_q_current: np.ndarray) -> np.ndarray:
+    """
+    Expand 23-D policy output (ascending motor index order, skipping hold indices) to full motor q.
+
+    Indices 4,5,10,11,13,14 keep motor_q_current; others are overwritten from server23 in order
+    G1_ACTION23_MOTOR_INDICES_ASC.
+    """
+    s = np.asarray(server23, dtype=np.float64).reshape(-1)
+    if s.size != 23:
+        raise ValueError(f"merge_server23_to_motor29: expected 23 targets, got {s.size}")
+    m = np.asarray(motor_q_current, dtype=np.float64).reshape(29)
+    out = m.copy()
+    for k, motor_i in enumerate(G1_ACTION23_MOTOR_INDICES_ASC):
+        out[motor_i] = s[k]
+    return out
+
+
+def clip_motor29_to_limits(motor_q: np.ndarray) -> np.ndarray:
+    q = np.asarray(motor_q, dtype=np.float64).reshape(29)
+    return np.clip(q, G1_MOTOR_Q_MIN, G1_MOTOR_Q_MAX)
+
+
 def _kp_kd_for_motor(motor_i: int) -> tuple[float, float]:
     if motor_i in _WRIST_MOTOR_IDX:
         return 40.0, 1.5
@@ -529,8 +625,8 @@ def extract_arm14_joint_targets(step1d: np.ndarray) -> np.ndarray:
     arm_clip = 2.5
     if d == 23:
         raise RuntimeError(
-            "execute_action: length-23 action is EE_R6 / ee_action_6d space — cannot convert to "
-            "LowCmd joint positions without inverse kinematics. TODO: IK bridge or joint-space policy."
+            "execute_action: 23-D joint actions use merge_server23 / build_motor_cmd_q_from_server23 in main; "
+            "not arm14 extraction."
         )
     if d == 16:
         raise RuntimeError(
@@ -541,7 +637,8 @@ def extract_arm14_joint_targets(step1d: np.ndarray) -> np.ndarray:
     if d == 29:
         return np.clip(step1d[15:29], -arm_clip, arm_clip)
     raise RuntimeError(
-        f"execute_action: unsupported action length {d}. Supported: 14 (arm q), 29 (motor q, uses slice [15:29])."
+        f"execute_action: unsupported action length {d}. Supported: 14 (arm q), 23 (motor q ascending, merge), "
+        "29 (motor q, uses slice [15:29])."
     )
 
 
@@ -550,39 +647,39 @@ def _limit_arm_delta(arm_tgt: np.ndarray, arm_cur: np.ndarray, max_delta: float)
     return np.clip(arm_cur + d, -2.5, 2.5)
 
 
-def publish_g129_arm_lowcmd(
-    *,
-    joint_positions_shm_boy29: np.ndarray,
-    arm14_target: np.ndarray,
+def build_motor_cmd_q_from_server23(
+    server23: np.ndarray,
+    motor_q_current: np.ndarray,
     max_arm_delta: float,
+) -> np.ndarray:
+    """Merge 23-D joint action with sim hold axes, clip limits, rate-limit arm slice 15:29."""
+    merged = merge_server23_to_motor29(server23, motor_q_current)
+    merged = clip_motor29_to_limits(merged)
+    arm_cur = motor_q_current[15:29].reshape(14)
+    arm_tgt = merged[15:29].reshape(14)
+    arm_send = _limit_arm_delta(arm_tgt, arm_cur, max_arm_delta)
+    motor_cmd_q = merged.copy()
+    motor_cmd_q[15:29] = arm_send
+    return motor_cmd_q
+
+
+def publish_g129_lowcmd(
+    *,
+    motor_cmd_q: np.ndarray,
     lowcmd_pub: object,
     crc: object,
+    log_detail: str,
 ) -> None:
-    """
-    Publish one LowCmd on rt/lowcmd. Simulator G1RobotDDS.dds_subscriber writes dds_robot_cmd SHM;
-    DDSActionProvider.get_action applies arm slots only (legs/waist held from commanded q[0:15]).
-    """
+    """Publish one LowCmd: full motor q[0:29] (length-29 vector, motor index order)."""
     from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 
-    motor_q = shm_boy29_to_motor29_q(joint_positions_shm_boy29)
-    arm_cur = motor_q[15:29].copy()
-    arm14 = np.asarray(arm14_target, dtype=np.float64).reshape(14)
-    arm_send = _limit_arm_delta(arm14, arm_cur, max_arm_delta)
-    motor_cmd_q = motor_q.copy()
-    motor_cmd_q[15:29] = arm_send
-
+    cmd = np.asarray(motor_cmd_q, dtype=np.float64).reshape(29)
     print(
-        f"[execute_action] interface: ChannelPublisher(topic={LOWCMD_TOPIC!r}, type={LOWCMD_MSG}) "
-        f"→ sim G1RobotDDS ChannelSubscriber({LOWCMD_TOPIC!r}, LowCmd_) → output_shm dds_robot_cmd "
-        f"→ action_provider/action_provider_dds.py DDSActionProvider.get_action (g129 arm-only indices 15..28)",
+        f"[execute_action] {log_detail} → ChannelPublisher({LOWCMD_TOPIC!r}, LowCmd_) "
+        f"→ sim G1RobotDDS / dds_robot_cmd",
         flush=True,
     )
-    print(f"[execute_action] parsed arm14 (motors 15..28, after delta limit): {np.array2string(arm_send, precision=4)}", flush=True)
-    print(
-        f"[execute_action] motor q[0:15] hold (no velocity base cmd; not rt/run_command/cmd): "
-        f"{np.array2string(motor_cmd_q[:15], precision=4)}",
-        flush=True,
-    )
+    print(f"[execute_action] motor_cmd q[0:29]: {np.array2string(cmd, precision=4)}", flush=True)
 
     msg = unitree_hg_msg_dds__LowCmd_()
     msg.mode_pr = 0
@@ -594,9 +691,8 @@ def publish_g129_arm_lowcmd(
             kp, kd = _kp_kd_for_motor(i)
             msg.motor_cmd[i].kp = kp
             msg.motor_cmd[i].kd = kd
-            msg.motor_cmd[i].q = float(motor_cmd_q[i])
+            msg.motor_cmd[i].q = float(cmd[i])
         else:
-            # Dex / extra motors: not proven for this milestone — conservative stiff hold at 0. TODO: mirror sim defaults.
             msg.motor_cmd[i].kp = 20.0
             msg.motor_cmd[i].kd = 1.0
             msg.motor_cmd[i].q = 0.0
@@ -609,6 +705,43 @@ def publish_g129_arm_lowcmd(
     except Exception as e:
         print(f"[execute_action] publisher.Write(LowCmd_) failed: {e!r} (ok=False)", flush=True)
         raise
+
+
+def publish_g129_arm_lowcmd(
+    *,
+    joint_positions_shm_boy29: np.ndarray,
+    arm14_target: np.ndarray,
+    max_arm_delta: float,
+    lowcmd_pub: object,
+    crc: object,
+) -> None:
+    """
+    Publish one LowCmd on rt/lowcmd. Simulator G1RobotDDS.dds_subscriber writes dds_robot_cmd SHM;
+    DDSActionProvider.get_action applies arm slots only (legs/waist commanded q[0:15] are not mapped to sim
+    joints today — only 15:28 feed the Isaac arm).
+    """
+    motor_q = shm_boy29_to_motor29_q(joint_positions_shm_boy29)
+    arm_cur = motor_q[15:29].copy()
+    arm14 = np.asarray(arm14_target, dtype=np.float64).reshape(14)
+    arm_send = _limit_arm_delta(arm14, arm_cur, max_arm_delta)
+    motor_cmd_q = motor_q.copy()
+    motor_cmd_q[15:29] = arm_send
+
+    print(
+        f"[execute_action] arm-only: parsed arm14 (motors 15..28, after delta limit): "
+        f"{np.array2string(arm_send, precision=4)}",
+        flush=True,
+    )
+    print(
+        f"[execute_action] motor q[0:15] hold from current sim q: {np.array2string(motor_cmd_q[:15], precision=4)}",
+        flush=True,
+    )
+    publish_g129_lowcmd(
+        motor_cmd_q=motor_cmd_q,
+        lowcmd_pub=lowcmd_pub,
+        crc=crc,
+        log_detail="arm-only LowCmd (legs/waist from current state)",
+    )
 
 
 def main() -> None:
@@ -675,8 +808,9 @@ def main() -> None:
         "--execute_action",
         action="store_true",
         help=(
-            "After /act, publish arm targets via DDS rt/lowcmd (LowCmd_). Default off = print only. "
-            "Requires joint-space action (14 or 29 dims per timestep); 23-D EE actions are rejected."
+            "After /act, publish via DDS rt/lowcmd (LowCmd_). Joint-space: 14 (arm only), "
+            "23 (ascending motor order, hold ankles+waist roll/pitch from sim), or 29 (arm slice from full motor q). "
+            "EE 6D / Cartesian 23-D is not supported here."
         ),
     )
     p.add_argument(
@@ -757,14 +891,36 @@ def main() -> None:
                 assert lowcmd_pub is not None and lowcmd_crc is not None
                 step_vec = action_vector_first_timestep(action)
                 print(f"[execute_action] first-timestep vector len={step_vec.size}", flush=True)
-                arm14 = extract_arm14_joint_targets(step_vec)
-                publish_g129_arm_lowcmd(
-                    joint_positions_shm_boy29=np.asarray(robot["joint_positions"], dtype=np.float64),
-                    arm14_target=arm14,
-                    max_arm_delta=args.execute_max_arm_delta,
-                    lowcmd_pub=lowcmd_pub,
-                    crc=lowcmd_crc,
+                motor_q = shm_boy29_to_motor29_q(
+                    np.asarray(robot["joint_positions"], dtype=np.float64)
                 )
+                if step_vec.size == 23:
+                    motor_cmd_q = build_motor_cmd_q_from_server23(
+                        step_vec, motor_q, args.execute_max_arm_delta
+                    )
+                    publish_g129_lowcmd(
+                        motor_cmd_q=motor_cmd_q,
+                        lowcmd_pub=lowcmd_pub,
+                        crc=lowcmd_crc,
+                        log_detail=(
+                            "23-D joint /act: ascending motors "
+                            f"{G1_ACTION23_MOTOR_INDICES_ASC}, hold {sorted(G1_ACTION23_HOLD_MOTOR_INDICES)} from sim"
+                        ),
+                    )
+                elif step_vec.size in (14, 29):
+                    arm14 = extract_arm14_joint_targets(step_vec)
+                    publish_g129_arm_lowcmd(
+                        joint_positions_shm_boy29=np.asarray(robot["joint_positions"], dtype=np.float64),
+                        arm14_target=arm14,
+                        max_arm_delta=args.execute_max_arm_delta,
+                        lowcmd_pub=lowcmd_pub,
+                        crc=lowcmd_crc,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"--execute_action: action length {step_vec.size} not supported. "
+                        "Use 14 (arm), 23 (joint ascending + sim hold), or 29 (full motor, arm-only sim mapping)."
+                    )
 
             if not args.loop:
                 break
