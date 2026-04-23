@@ -1,5 +1,14 @@
-# Dependencies for sim_to_vla_client.py only (not the full simulator or VLA stack).
+# Dependencies for sim_to_vla_client.py (not the full simulator or VLA training stack).
 json_numpy
 numpy
 opencv-python
 requests
+
+# --execute_action: unitree_sdk2py + Cyclone DDS (same env as unitree_sim_isaaclab); install separately from Unitree.
+
+# --execute-ee-action-ik: vla_ee_ik_bridge.py + unitree_lerobot/eval_robot/robot_control/robot_arm_ik.py (G1_29_ArmIK)
+meshcat==0.3.2
+casadi>=3.6.0
+# Pinocchio (import pinocchio). Pip wheels are platform-sparse; use conda-forge when possible:
+#   conda install pinocchio -c conda-forge
+# Then: pip install -r requirements.txt

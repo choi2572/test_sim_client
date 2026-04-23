@@ -2,7 +2,8 @@
 """
 Minimal G1 bridge: read Isaac Lab shared-memory camera + robot state, POST /act, print action.
 
-Does not start the simulator or VLA server. Does not apply actions back to the sim.
+Does not start the simulator or VLA server. Optional: --execute_action sends LowCmd; for UnifoLM
+ee_action_6d (23-D) use --execute-ee-action-ik (see vla_ee_ik_bridge.py).
 """
 from __future__ import annotations
 
@@ -883,7 +884,16 @@ def main() -> None:
         help=(
             "After /act, publish via DDS rt/lowcmd (LowCmd_). Joint-space: 14 (arm only), "
             "23 (ascending motor order, hold ankles+waist roll/pitch from sim), or 29 (arm slice from full motor q). "
-            "EE 6D / Cartesian 23-D is not supported here."
+            "For UnifoLM ee_action_6d (23), use --execute-ee-action-ik instead of treating 23 as joint targets."
+        ),
+    )
+    p.add_argument(
+        "--execute-ee-action-ik",
+        action="store_true",
+        help=(
+            "With --execute_action and 23-D /act output: decode ee_action_6d → SE(3)×2, run unitree_lerobot "
+            "G1_29_ArmIK (Pinocchio/CasADi), then LowCmd. Requires pinocchio, casadi, meshcat. "
+            "Waist+gripper components in the 23-vector are not driven by IK (model locks those joints)."
         ),
     )
     p.add_argument(
@@ -906,8 +916,12 @@ def main() -> None:
         except (OSError, ValueError) as e:
             raise SystemExit(str(e)) from e
 
+    if args.execute_ee_action_ik and not args.execute_action:
+        raise SystemExit("--execute-ee-action-ik requires --execute_action")
+
     lowcmd_pub = None
     lowcmd_crc = None
+    ee_ik_solver = None
     if args.execute_action:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
@@ -922,6 +936,11 @@ def main() -> None:
             f"[execute_action] publisher ready: topic={LOWCMD_TOPIC!r} msg=LowCmd_ (persistent for this process)",
             flush=True,
         )
+        if args.execute_ee_action_ik:
+            from vla_ee_ik_bridge import create_g129_ee_ik_solver
+
+            print("[execute_action] Initializing G1_29_ArmIK for ee_action_6d (may take a few seconds)...", flush=True)
+            ee_ik_solver = create_g129_ee_ik_solver()
 
     reader = AttachOnlyImageReader()
     state_shm = open_robot_state_shm_readonly(args.robot_state_shm)
@@ -975,18 +994,40 @@ def main() -> None:
                     np.asarray(robot["joint_positions"], dtype=np.float64)
                 )
                 if step_vec.size == 23:
-                    motor_cmd_q = build_motor_cmd_q_from_server23(
-                        step_vec, motor_q, args.execute_max_arm_delta
-                    )
-                    publish_g129_lowcmd(
-                        motor_cmd_q=motor_cmd_q,
-                        lowcmd_pub=lowcmd_pub,
-                        crc=lowcmd_crc,
-                        log_detail=(
-                            "23-D joint /act: ascending motors "
-                            f"{G1_ACTION23_MOTOR_INDICES_ASC}, hold {sorted(G1_ACTION23_HOLD_MOTOR_INDICES)} from sim"
-                        ),
-                    )
+                    if args.execute_ee_action_ik:
+                        from vla_ee_ik_bridge import solve_arm_ik_from_ee_action23
+
+                        assert ee_ik_solver is not None
+                        arm_cur = motor_q[15:29].astype(np.float64).reshape(14)
+                        sol_q, _tau = solve_arm_ik_from_ee_action23(ee_ik_solver, step_vec, arm_cur)
+                        merged = np.asarray(motor_q, dtype=np.float64).reshape(29).copy()
+                        arm_send = _limit_arm_delta(
+                            sol_q.reshape(14), arm_cur.reshape(14), args.execute_max_arm_delta
+                        )
+                        merged[15:29] = arm_send
+                        merged = clip_motor29_to_limits(merged)
+                        publish_g129_lowcmd(
+                            motor_cmd_q=merged,
+                            lowcmd_pub=lowcmd_pub,
+                            crc=lowcmd_crc,
+                            log_detail=(
+                                "23-D ee_action_6d → G1_29_ArmIK → arm q[15:29]; "
+                                "legs/waist from current sim; IK ignores tail5 (gripper+waist in action vec)"
+                            ),
+                        )
+                    else:
+                        motor_cmd_q = build_motor_cmd_q_from_server23(
+                            step_vec, motor_q, args.execute_max_arm_delta
+                        )
+                        publish_g129_lowcmd(
+                            motor_cmd_q=motor_cmd_q,
+                            lowcmd_pub=lowcmd_pub,
+                            crc=lowcmd_crc,
+                            log_detail=(
+                                "23-D joint /act: ascending motors "
+                                f"{G1_ACTION23_MOTOR_INDICES_ASC}, hold {sorted(G1_ACTION23_HOLD_MOTOR_INDICES)} from sim"
+                            ),
+                        )
                 elif step_vec.size in (14, 29):
                     arm14 = extract_arm14_joint_targets(step_vec)
                     publish_g129_arm_lowcmd(
