@@ -419,6 +419,7 @@ def build_observation(
     left_bgr: np.ndarray | None,
     right_bgr: np.ndarray | None,
     state_vector: np.ndarray,
+    task_name: Optional[str] = None,
 ) -> dict:
     """
     One element of payload['observations'] with exact keys expected by get_server_action.
@@ -428,11 +429,40 @@ def build_observation(
         "instruction": instruction,
         "state": state_vector,
     }
+    if task_name is not None:
+        obs["task_name"] = task_name
     if left_bgr is not None:
         obs["left_wrist"] = _bgr_to_rgb_u8(left_bgr)
     if right_bgr is not None:
         obs["right_wrist"] = _bgr_to_rgb_u8(right_bgr)
     return obs
+
+
+def validate_task_name_in_dataset_statistics(task_name: str, stats_path: Path) -> None:
+    """Ensure task_name is a top-level key like run_real_eval_server's vla.norm_stats[task_name]."""
+    if not stats_path.is_file():
+        raise FileNotFoundError(
+            f"dataset_statistics.json not found at {stats_path!s}. "
+            "Pass --dataset-statistics-json pointing to the JSON next to your checkpoint run, "
+            "or place dataset_statistics.json in the repo root."
+        )
+    raw = json.loads(stats_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{stats_path} must be a JSON object with task keys at the top level.")
+    if task_name not in raw:
+        keys = sorted(raw.keys())
+        raise ValueError(
+            f"task_name {task_name!r} is not a top-level key in {stats_path}. "
+            f"Available keys: {keys}"
+        )
+    block = raw[task_name]
+    if not isinstance(block, dict):
+        raise ValueError(f"{stats_path}[{task_name!r}] must be an object with 'action' and 'proprio'.")
+    for need in ("action", "proprio"):
+        if need not in block:
+            raise ValueError(
+                f"{stats_path}[{task_name!r}] missing {need!r} (run_real_eval_server expects both)."
+            )
 
 
 def build_g1_state_vector(
@@ -805,6 +835,25 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--dataset-statistics-json",
+        type=Path,
+        default=_REPO / "dataset_statistics.json",
+        help=(
+            "dataset_statistics.json path (checkpoint run dir). Used only to validate --task-name "
+            f"against top-level keys (default: {_REPO / 'dataset_statistics.json'})"
+        ),
+    )
+    p.add_argument(
+        "--task-name",
+        type=str,
+        default=None,
+        help=(
+            "If set, add observations[0]['task_name'] so run_real_eval_server selects "
+            "norm_stats[task_name]['action'/'proprio']. Must match a top-level key in "
+            "--dataset-statistics-json."
+        ),
+    )
+    p.add_argument(
         "--execute_action",
         action="store_true",
         help=(
@@ -826,6 +875,12 @@ def main() -> None:
         help="Max |Δq| rad per arm joint per command (safety)",
     )
     args = p.parse_args()
+
+    if args.task_name is not None:
+        try:
+            validate_task_name_in_dataset_statistics(args.task_name, args.dataset_statistics_json)
+        except (OSError, ValueError) as e:
+            raise SystemExit(str(e)) from e
 
     lowcmd_pub = None
     lowcmd_crc = None
@@ -877,6 +932,7 @@ def main() -> None:
                 left_bgr=left,
                 right_bgr=right,
                 state_vector=state_vec,
+                task_name=args.task_name,
             )
             payload = {"observations": [obs]}
 
