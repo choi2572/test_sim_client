@@ -495,6 +495,28 @@ def build_g1_state_vector(
         vec = pose17_to_pose23(p17)
         return vec, todos
 
+    ee6_shm = robot.get("ee_state_6d")
+    if ee6_shm is not None:
+        vec = np.asarray(ee6_shm, dtype=np.float32).reshape(-1)
+        if vec.size != 23:
+            raise ValueError(
+                f"robot['ee_state_6d'] from SHM must be length 23 (got {vec.size}). "
+                "Update unitree_sim_isaaclab g1_29dof_state / Isaac USD link names if needed."
+            )
+        todos.append(
+            "Using robot['ee_state_6d'] from Isaac SHM (sim-computed; matches RLDS ee_state_6d layout when FK matches training)."
+        )
+        return vec, todos
+
+    eeq_shm = robot.get("ee_qpos")
+    if eeq_shm is not None:
+        p17 = np.asarray(eeq_shm, dtype=np.float64).reshape(-1)
+        if p17.size != 17:
+            raise ValueError(f"robot['ee_qpos'] from SHM must be length 17 (got {p17.size})")
+        vec = pose17_to_pose23(p17)
+        todos.append("Using robot['ee_qpos'] from Isaac SHM → pose17_to_pose23.")
+        return vec, todos
+
     pos = robot.get("joint_positions")
     if pos is None:
         raise KeyError("isaac_robot_state missing 'joint_positions'")
@@ -528,7 +550,9 @@ def build_g1_state_vector(
             "23-D ee_state_6d proprio (norm_stats shape (23,)), not raw body joints. "
             "That mismatch causes: ValueError operands (1,29) and (23,). "
             "옵션:\n"
-            "  • 정석: --ee-pose17-json 또는 --state-json (23-D ee_state_6d).\n"
+            "  • Isaac가 SHM에 ee_state_6d/ee_qpos를 쓰도록 하면: 최신 unitree_sim_isaaclab의 g1_29dof_state + "
+            "g1_robot_dds.write_robot_state 확장 사용(자동으로 sim_to_vla_client가 읽음).\n"
+            "  • 정석(파일): --ee-pose17-json 또는 --state-json (23-D ee_state_6d).\n"
             "  • «일단 돌려보기»만: --experimental-manip23-from-shm29 (관절 부분집합 23개, 의미 불일치).\n"
             "  • 직접 고르기: --gather-global-indices-json FILE (JSON 리스트, G1 글로벌 관절 번호 0..28, "
             "순서가 출력 벡터 순서). SHM 슬롯 변환은 boy_joint_indices 기준으로 이 파일에 내장됨.\n"
